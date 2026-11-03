@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>手下看板</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%234C6FFF' stroke='%231E2235' stroke-width='2'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="assets/board.css">
+  <script>
+    (function () {
+      var q = new URLSearchParams(location.search);
+      var name = q.get("fixture");
+      if (name && name !== "missing" && name !== "broken") {
+        document.write('<script src="assets/fixtures/kit.js"><\/script>');
+      }
+      if (name) {
+        document.write('<script src="assets/fixtures/' + encodeURIComponent(name) + '.js" data-board-data="1"><\/script>');
+        return;
+      }
+      // 盒子上用 file:// 打开时，直接读本地快照。
+      // 用 http 打开时先不插这个脚本，页面会去要 /api/board，没有接口再退回这份文件。
+      if (location.protocol === "file:") {
+        document.write('<script src="data/board-data.js" data-board-data="1"><\/script>');
+      }
+    })();
+  </script>
+</head>
+<body>
+  <a class="skip" href="#history">跳到历史</a>
+  <div id="app"></div>
+  <div id="live" role="status" aria-live="polite" aria-atomic="true"></div>
+  <div id="toast" aria-hidden="true"></div>
+  <script src="assets/avatars.js"></script>
+  <script src="assets/board.js"></script>
+</body>
+</html>

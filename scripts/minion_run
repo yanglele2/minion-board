@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""先记开始，再跑手下命令，最后一定记结束。
+
+用法：
+  minion_run --helper codex|hermes|pi --bot t06 --task "一句话" [--route-id X] -- 命令 参数…
+
+标准输出和标准错误原样转给后面的命令。退出码也原样返回。
+Ctrl-C 或 SIGTERM 时仍会写一条结束事件（失败，原因是被取消）。
+Codex 输出里如果出现额度用完或容量满，会额外写一条 quota 事件。
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import minion_lib as lib
+
+
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if "--" in argv:
+        split = argv.index("--")
+        tool_args = argv[:split]
+        command = argv[split + 1 :]
+    else:
+        tool_args = argv
+        command = []
+
+    parser = argparse.ArgumentParser(description="包一层 start/end 再执行手下命令")
+    parser.add_argument("--helper", required=True, choices=lib.MINIONS)
+    parser.add_argument("--bot", required=True)
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--route-id", default="")
+    parser.add_argument("--task-type", default="")
+    parser.add_argument("--model", default="")
+    parser.add_argument("--host", default="")
+    parser.add_argument("--expect-minutes", type=int, default=None)
+    parser.add_argument("--parent-task-id", default="")
+    parser.add_argument("--degraded-to", default="", choices=("", *lib.DEGRADED_TO))
+    parser.add_argument("--fail-kind", default="", choices=("", *lib.FAIL_KINDS))
+    parser.add_argument("--writer", default="")
+    parser.add_argument("--events-dir", default=str(lib.DEFAULT_EVENTS_DIR))
+    parser.add_argument("--no-build", action="store_true")
+    args = parser.parse_args(tool_args)
+    if not command:
+        print("minion_run：缺少要执行的命令。请在 -- 后面写上命令。", file=sys.stderr)
+        return 2
+
+    bot = args.bot.lower()
+    writer = (args.writer or bot).lower()
+    events_dir = Path(args.events_dir)
+    start = lib.make_start(
+        minion=args.helper,
+        bot=bot,
+        title=args.task,
+        writer=writer,
+        task_type=args.task_type,
+        route_ref=args.route_id,
+        model=args.model,
+        host=args.host,
+        expect_minutes=args.expect_minutes,
+        parent_task_id=args.parent_task_id,
+    )
+    try:
+        lib.append_event(start, events_dir)
+    except OSError as exc:
+        print(f"minion_run：开始记录没写上：{exc}", file=sys.stderr)
+        return 1
+
+    interrupted: list[int] = []
+    child: dict[str, subprocess.Popen | None] = {"proc": None}
+
+    def on_signal(signum, _frame):
+        # 不在这里抛异常。把信号转给子进程，等它退出后 finally 会写结束。
+        interrupted.append(signum)
+        proc = child["proc"]
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.send_signal(signum)
+            except OSError:
+                pass
+
+    previous_int = signal.signal(signal.SIGINT, on_signal)
+    previous_term = signal.signal(signal.SIGTERM, on_signal)
+    return_code = 1
+    captured: list[bytes] = []
+    launch_error = ""
+    try:
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=sys.stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            launch_error = str(exc)
+            print(f"minion_run：命令没启动：{exc}", file=sys.stderr)
+            return_code = 127
+            proc = None
+        if proc is not None:
+            child["proc"] = proc
+            threads = [
+                threading.Thread(target=_pump, args=(proc.stdout, sys.stdout, captured), daemon=True),
+                threading.Thread(target=_pump, args=(proc.stderr, sys.stderr, captured), daemon=True),
+            ]
+            for thread in threads:
+                thread.start()
+            grace_deadline = None
+            while proc.poll() is None:
+                try:
+                    proc.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    if not interrupted:
+                        continue
+                    if grace_deadline is None:
+                        grace_deadline = time.time() + 2
+                    elif time.time() >= grace_deadline:
+                        proc.kill()
+            return_code = proc.returncode if proc.returncode is not None else 1
+            for thread in threads:
+                thread.join(timeout=2)
+    finally:
+        signal.signal(signal.SIGINT, previous_int)
+        signal.signal(signal.SIGTERM, previous_term)
+        output = launch_error or b"".join(captured).decode("utf-8", errors="replace")
+        signum = interrupted[-1] if interrupted else None
+        status, fail_kind, fail_text, quota_state = _judge(args, return_code, output, signum)
+        if quota_state:
+            reset = lib.guess_reset_at(output) if quota_state == "quota_exhausted" else None
+            quota = lib.make_quota(
+                state=quota_state,
+                writer=writer,
+                reset_at=reset,
+                raw=output,
+            )
+            try:
+                lib.append_event(quota, events_dir)
+            except OSError as exc:
+                print(f"minion_run：额度记录没写上：{exc}", file=sys.stderr)
+        _write_end(
+            args,
+            start,
+            writer,
+            events_dir,
+            status=status,
+            fail_kind=fail_kind,
+            fail_text=fail_text,
+            exit_code=return_code if return_code is not None and return_code >= 0 else None,
+            output=output,
+        )
+        if not args.no_build:
+            lib.trigger_build(events_dir)
+
+    if return_code is None:
+        return 1
+    if return_code < 0:
+        return 128 + abs(return_code)
+    return return_code
+
+
+def _pump(src, dest, bucket: list[bytes]) -> None:
+    if src is None:
+        return
+    try:
+        while True:
+            chunk = src.read(65536)
+            if not chunk:
+                break
+            bucket.append(chunk)
+            _write_through(dest, chunk)
+    except Exception:
+        return
+
+
+def _write_through(dest, chunk: bytes) -> None:
+    buffer = getattr(dest, "buffer", None)
+    if buffer is not None:
+        buffer.write(chunk)
+        buffer.flush()
+        return
+    dest.write(chunk.decode("utf-8", errors="replace"))
+    dest.flush()
+
+
+def _judge(args, return_code: int | None, output: str, signum: int | None):
+    """决定结束状态。成功写成 success，不用 ok。"""
+    issue = None
+    if args.helper == "codex" or "usage limit" in output.lower() or "at capacity" in output.lower():
+        issue = lib.detect_codex_issue(output)
+    if signum is not None and issue is None:
+        return "failed", "cancelled", "被中断", None
+    quota_state = None
+    fail_kind = args.fail_kind or None
+    if issue == "quota_exhausted":
+        quota_state = "quota_exhausted"
+        fail_kind = fail_kind or "quota"
+    elif issue == "capacity":
+        quota_state = "capacity"
+        fail_kind = fail_kind or "capacity"
+    if args.degraded_to:
+        return "degraded", fail_kind or "unknown", _short_reason(output, fail_kind), quota_state
+    if issue == "quota_exhausted" or issue == "capacity":
+        return "failed", fail_kind or "error", _short_reason(output, fail_kind), quota_state
+    if return_code == 0:
+        return "success", None, None, None
+    return "failed", fail_kind or "error", _short_reason(output, fail_kind or "error"), None
+
+
+def _short_reason(output: str, fail_kind: str | None) -> str:
+    if fail_kind == "quota":
+        return "Codex 额度用完"
+    if fail_kind == "capacity":
+        return "Codex 正忙（容量满）"
+    if fail_kind == "cancelled":
+        return "被中断"
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return lib.clip_text(lines[-1], 120)
+
+
+def _write_end(args, start, writer, events_dir, status, fail_kind, fail_text, exit_code, output) -> None:
+    try:
+        event = lib.make_end(
+            task_id_value=start["task_id"],
+            minion=args.helper,
+            status=status,
+            writer=writer,
+            degraded_to=args.degraded_to or None,
+            fail_kind=fail_kind,
+            fail_text=fail_text,
+            exit_code=exit_code,
+        )
+        lib.append_event(event, events_dir)
+    except (OSError, ValueError) as exc:
+        print(f"minion_run：结束记录没写上：{exc}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # 信号已经在 main 里处理。这里兜住解释器退出前的二次中断。
+        sys.exit(130)

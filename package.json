@@ -1,0 +1,12 @@
+{
+  "name": "minion-board",
+  "private": true,
+  "description": "手下看板。盒子把快照推上来，公开页面隔一小会儿读一次。",
+  "scripts": {
+    "test": "python3 tests/test_acceptance.py && node --test tests/test_api.js && python3 tests/test_push.py",
+    "dev": "node tests/dev-server.js"
+  },
+  "engines": {
+    "node": "22.x"
+  }
+}
